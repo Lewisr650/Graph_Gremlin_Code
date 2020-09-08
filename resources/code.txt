@@ -1,0 +1,2138 @@
+--------------------NOTEBOOK_Confluxsys--------------------
+--------------------CELL_MARKDOWN_1--------------------
+/**
+ * ----------- ALERT -----------------------
+ *  Alerts reaised on entity. Will always be current (no historical information)
+ *  Optimized for UI Requests
+ *
+ *  TODO:
+ *  Choose primary key such that it does not require a lookup. Ex: taskId,type,entityGlobalId?
+ *  Should 'level' be the part of the primary key?
+ *  Search index: ??
+ *
+ * level: 1 -5; 5: Critical, 4: High, 3: Medium, 2: Low, 1: Informational
+ * type:
+ * messages: 0: Severity (INFO, WARN, ERROR); 1: Verbose message. (Bug: tuple elements with Ascii did not work)
+ * ackRequired: set to false if the alert has been "reviewed" by a user OR alert level < 'n'; else it is set to false
+ */
+// Load using gremlin console using: following command
+//gremlin> :load /Users/manish/ws/products/dev/iap-adc/adc-root/setup/scripts/cassandra/graph_schema_v2/0-base-schema.groovy
+--------------------CELL_GREMLIN_2--------------------
+//--------------vertex : Alert --------------------------------------------------//
+schema.vertexLabel('Alert').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        clusterBy('taskId', Int).
+        clusterBy('alertType', Ascii, Asc).
+        clusterBy('entityGlobalId', Uuid).
+        property('raisedTime', Timestamp).
+        property('gid', Ascii).
+        property('level', Tinyint).
+        property('updateTime', Timestamp).
+        property('processId', Uuid).
+        property('summary', Text).
+        property('taskName', Ascii).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('messages', listOf(listOf(Text))).
+        property('ackRequired', Boolean).
+        property('acknowledged', Boolean).
+        property('acknowledgedByUserid', Ascii).
+        create()
+
+
+/**
+ * ---------------- EVENT -----------------------------------
+ * createTimeBucket: a partitioning key, formed by 6 digit number; first 4 represent Year, next 2 represent month.
+ * While catering to the time-based queries, calculate buckets: startTime => every month between (startTime, endTime) as (YYYYMM)
+ *
+ * query starting point; any time-related queries would start from event.
+ * > entityGlobalId, entitykey and nativeId are kept because actual Entity node might be deleted before the event expires.
+ * > Events expire after 18 months. Should not require any indexes (run following: cqlsh:iap> alter table  "Event" with default_time_to_live=46656000;)
+ *
+ *
+ * Improvements:
+ * More attributes from Entity may be copied as deleted entity would not be stored in current region.
+ */
+schema.vertexLabel('Event').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        partitionBy('createTimeBucket', Ascii).
+        clusterBy('eventCategory', Ascii, Asc).
+        clusterBy('createTime', Timestamp, Desc).
+        clusterBy('entityGlobalId', Uuid, Asc).
+        clusterBy('type', Ascii, Asc).
+        property('gid', Ascii).
+        property('processId', Uuid).
+        property('entityKey', Text).
+        property('nativeId', Text).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('attributes', mapOf(Text, Text)).
+        create()
+
+// name is not correct, no time constraint here, why do we even need it ?
+//governance ode will traverse from Entity to event.
+//TODO: using coalesce operation? requires a lookup
+schema.vertexLabel('Event').materializedView('Event_By_Time').
+        ifNotExists().
+        partitionBy('tenantId').
+        partitionBy('appId').
+        partitionBy('nativeType').
+        partitionBy('processId').
+        clusterBy('eventCategory').
+        clusterBy('type', Asc).
+        clusterBy('entityGlobalId', Asc).
+        waitForIndex(5).
+        create()
+
+
+/**
+ * Entity
+ *  Part of model graph; contains 'unboxed' fields and category specific relationships
+ *
+ *  status: Active, Masked, Deleted; Note: deleted entities are not stored in the companion "category vertex"
+ *
+ * Component Vertex (Category Vertex):
+ * status: Active, Masked, Deleted, Discovered
+ *
+ *  TODOs:
+ *
+ */
+
+
+schema.vertexLabel('Entity').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        partitionBy('entityGlobalId', Uuid).
+        property('entityKey', Text).
+        property('signature', Ascii).
+        property('status', Ascii).
+        property('metaType', Ascii).
+        property('nativeStatus', Ascii).
+        property('updateTime', Timestamp).
+        property('nativeAsOnTime', Timestamp).
+        property('nativeModifiedOnTime', Timestamp).
+        property('createTime', Timestamp).
+        property('nativeId', Text).
+        property('name', Text).
+        property('description', Text).
+
+        property('data', Text).
+        create()
+
+//Do not create search indexes on ENTITY vertex, create on its <category> specific companion vertex
+
+
+schema.edgeLabel('With_Alert').
+        ifNotExists().
+        from('Entity').to('Alert').
+        create()
+
+schema.edgeLabel('With_Alert').
+        from('Entity').to('Alert').
+        materializedView('Entity_With_Alert_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        partitionBy(IN, 'taskId').
+        partitionBy(IN, 'alertType').
+        partitionBy(IN, 'entityGlobalId').
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityGlobalId', Asc).
+        create()
+
+
+/*
+todo:
+should (eventCategory, event createTime) be added for better traversal?
+ */
+schema.edgeLabel('With_Event').
+        ifNotExists().
+        from('Entity').to('Event').
+        clusterBy(IN, 'eventCategory', 'Event_eventCategory', Asc).
+        clusterBy(IN, 'createTime', 'Event_createTime', Desc).
+        create()
+
+//Materialized View
+schema.edgeLabel('With_Event').
+        from('Entity').to('Event').
+        materializedView('Entity_With_Event_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        partitionBy(IN, 'createTimeBucket').
+        partitionBy(IN, 'eventCategory').
+        partitionBy(IN, 'createTime').
+        partitionBy(IN, 'type').
+        partitionBy(IN, 'entityGlobalId').
+        clusterBy(OUT, 'entityGlobalId', Asc).
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        create()
+
+
+
+/**
+ * Entity Instance
+ * TTL: 18 months
+ * Bucket: derived form createTime => Month & Year
+ * Status: Active, Masked, Deleted
+ * Entity Action: Create | Modify | Delete | None | Unknown
+ * Native Status: Target Status (Active | Enabled | Disabled | Expired)
+ * Create Time: Time when the instances for registered by Processing component (PE table), not the time when instances was created in the graph.
+ */
+
+schema.vertexLabel('EntityInstance').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        partitionBy('createTimeBucket', Ascii).
+        clusterBy('createTime', Timestamp, Desc).
+        clusterBy('instanceId', Ascii, Asc).
+        property('entityGlobalId', Uuid).
+        property('entityKey', Text).
+        property('nativeId', Text).
+        property('processId', Uuid).
+        property('status', Ascii).
+        property('entityAction', Ascii).
+        property('metaType', Ascii).
+        property('nativeStatus', Ascii).
+        property('nativeAsOnTime', Timestamp).
+        property('nativeModifiedOnTime', Timestamp).
+        property('data', Text).
+        property('name', Text).
+        create()
+
+/**
+ * Relationship between INSTANCE and ENTITY.
+ * Relationship may cease to exists when entity is deleted.
+ */
+schema.edgeLabel('Of_Entity').
+        ifNotExists().
+        from('EntityInstance').to('Entity').
+        create()
+
+--------------------CELL_GREMLIN_3--------------------
+/**
+ * ------------- User -------------------------
+ * nativeId = userId;  -- set by the processing component
+ * entityKey = upper(nativeId) -- set by the processing component
+ * metaType = Non-User / User
+ * userType = only if metaType = User; Employee, Contractor, ..
+ *
+ * name = Full Name
+ * nativeStatus = Status in HR
+ *
+ *
+ */
+schema.vertexLabel('User').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        clusterBy('entityKey', Text).
+        property('entityGlobalId', Uuid).
+        property('category', Ascii).
+        property('status', Ascii).
+        property('metaType', Ascii).
+        property('nativeStatus', Ascii).
+        property('updateTime', Timestamp).
+        property('nativeAsOnTime', Timestamp).
+        property('nativeModifiedOnTime', Timestamp).
+        property('createTime', Timestamp).
+        property('nativeId', Text).
+        property('name', Text).
+
+//        property('userId', Text). use nativeId
+        property('firstName', Text).
+        property('lastName', Text).
+        property('displayName', Text).
+        property('email', Ascii).
+        property('userType', Ascii).
+        create()
+
+schema.edgeLabel('Is').
+        ifNotExists().
+        from('User').to('Entity').
+        create()
+
+schema.edgeLabel('Is').
+        from('User').to('Entity').
+        materializedView('User_Is_Entity_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        partitionBy(IN, 'entityGlobalId').
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+schema.vertexLabel('User').
+        searchIndex().
+        ifNotExists().
+        by('entityKey').asString().
+        by('name').
+        by('metaType').
+        waitForIndex(5).
+        create()
+--------------------CELL_GREMLIN_4--------------------
+/**
+ * Entitlement
+ *
+ *  status: Active, Masked, Deleted, Discovered
+ */
+
+// Load using gremlin console using: following command
+//gremlin> :load ${GIT_HOME}/iap-adc/adc-root/setup/scripts/cassandra/graph_schema/entitlement-schema.groovy
+schema.vertexLabel('Entitlement').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        clusterBy('entityKey', Text).
+        property('entityGlobalId', Uuid).
+        property('status', Ascii).
+        property('metaType', Ascii).
+        property('nativeStatus', Ascii).
+        property('updateTime', Timestamp).
+        property('nativeAsOnTime', Timestamp).
+        property('nativeModifiedOnTime', Timestamp).
+        property('createTime', Timestamp).
+        property('nativeId', Text).
+        property('name', Text).
+        property('description', Text).
+        property('ownerUserId', Text).
+        property('data', Text).
+        property('category', Ascii).
+        property('displayName', Text).
+        create()
+
+schema.vertexLabel('Entitlement').
+        searchIndex().
+        ifNotExists().
+        by('entityKey').asString().
+        by('name').
+        by('displayName').asText().
+        by('description').asText().
+        by('status').
+        by('metaType').
+        by('updateTime').
+        by('ownerUserId').asString().
+        waitForIndex(5).
+        create()
+
+schema.edgeLabel('Is').
+        ifNotExists().
+        from('Entitlement').to('Entity').
+        create()
+
+//Materialized View
+schema.edgeLabel('Is').
+        from('Entitlement').to('Entity').
+        materializedView('Entitlement_Is_Entity_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        partitionBy(IN, 'entityGlobalId').
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+
+/** RELATIONSHIP with User
+category = Account_Actor
+type = relationship type name
+valuePath = SCIM Value path
+ */
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from('Entitlement').to('User').
+        clusterBy('type', Ascii, Asc).
+        property('category', Ascii).
+        property('createTime', Timestamp).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('data', Text).
+        create()
+
+schema.edgeLabel('Is_Related_To').
+        from('Entitlement').to('User').
+        materializedView('Entitlement_Actor_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'entityKey').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        clusterBy('type', Asc).
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+
+
+--------------------CELL_GREMLIN_5--------------------
+/**
+ * ACCOUNT: a searchable, concrete Vertex
+ *  Part of model graph; contains 'unboxed' fields and category specific relationships
+ *
+ *  status: Active, Masked, Discovered; Deleted entities are not stored in the vertex.
+ *
+ *  TODOs:
+ *
+ */
+
+// Load using gremlin console using: following command
+//gremlin> :load /Users/manish/ws/products/dev/iap-adc/adc-root/setup/scripts/cassandra/graph_schema/2-account-schema.groovy
+
+schema.vertexLabel('Account').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        clusterBy('entityKey', Text).
+        property('entityGlobalId', Uuid).
+        property('status', Ascii).
+        property('metaType', Ascii).
+        property('nativeStatus', Ascii).
+        property('updateTime', Timestamp).
+        property('nativeAsOnTime', Timestamp).
+        property('nativeModifiedOnTime', Timestamp).
+        property('createTime', Timestamp).
+        property('nativeId', Text).
+        property('name', Text).
+        property('description', Text).
+        property('ownerUserId', Text).
+        property('data', Text).
+        property('category', Ascii).
+        create()
+
+//Ensure no searches are made without partitioning key
+schema.vertexLabel('Account').
+        searchIndex().
+        ifNotExists().
+        by('entityKey').asString().
+        by('name').
+        by('status').
+        by('metaType').
+        by('updateTime').
+        by('ownerUserId').asString().
+        waitForIndex(5).
+        create()
+
+schema.edgeLabel('Is').
+        ifNotExists().
+        from('Account').to('Entity').
+        create()
+
+//Materialized View
+schema.edgeLabel('Is').
+        from('Account').to('Entity').
+        materializedView('Account_Is_Entity_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        partitionBy(IN, 'entityGlobalId').
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+/**
+ * Relationship between Account and User.
+ * type: owner | custodian
+ */
+
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from('Account').to('User').
+        clusterBy('type', Ascii, Asc).
+        property('category', Ascii).
+        property('createTime', Timestamp).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('data', Text).
+        create()
+
+schema.edgeLabel('Is_Related_To').
+        from('Account').to('User').
+        materializedView('Account_Actor_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'entityKey').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        clusterBy('type', Asc).
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+/** Relationship with Entitlement
+ category = Account_Entitlement
+ type = relationship type name
+ valuePath = SCIM Value path
+ */
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from('Account').to('Entitlement').
+        clusterBy('type', Ascii, Asc).
+        property('category', Ascii).
+        property('createTime', Timestamp).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('data', Text).
+        create()
+--------------------CELL_GREMLIN_6--------------------
+
+/**
+ * Role
+ *
+ *  status: Active, Masked, Deleted, Discovered
+ */
+
+// Load using gremlin console using: following command
+//gremlin> :load ${GIT_HOME}/iap-adc/adc-root/setup/scripts/cassandra/graph_schema/4-role-schema.groovy
+
+schema.vertexLabel('Role').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        clusterBy('entityKey', Text).
+        property('entityGlobalId', Uuid).
+        property('status', Ascii).
+        property('metaType', Ascii).
+        property('nativeStatus', Ascii).
+        property('updateTime', Timestamp).
+        property('nativeAsOnTime', Timestamp).
+        property('nativeModifiedOnTime', Timestamp).
+        property('createTime', Timestamp).
+        property('nativeId', Text).
+        property('name', Text).
+        property('description', Text).
+        property('ownerUserId', Text).
+        property('data', Text).
+        property('category', Ascii).
+        property('displayName', Text).
+        create()
+
+schema.vertexLabel('Role').
+        searchIndex().
+        ifNotExists().
+        by('entityKey').asString().
+        by('name').
+        by('displayName').asText().
+        by('description').asText().
+        by('status').
+        by('metaType').
+        by('updateTime').
+        by('ownerUserId').asString().
+        waitForIndex(30).
+        create()
+
+schema.edgeLabel('Is').
+        ifNotExists().
+        from('Role').to('Entity').
+        create()
+
+//Materialized View
+schema.edgeLabel('Is').
+        from('Role').to('Entity').
+        materializedView('Role_Is_Entity_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        partitionBy(IN, 'entityGlobalId').
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+
+/** RELATIONSHIP with User
+ category = Owner
+ type = relationship type name
+ valuePath = SCIM Value path
+ */
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from('Role').to('User').
+        clusterBy('type', Ascii, Asc).
+        property('category', Ascii).
+        property('createTime', Timestamp).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('data', Text).
+        create()
+
+schema.edgeLabel('Is_Related_To').
+        from('Role').to('User').
+        materializedView('Role_Actor_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'entityKey').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        clusterBy('type', Asc).
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+--------------------CELL_GREMLIN_7--------------------
+/**
+ * Platform
+ * currently used by application type and application categories only
+ * TODO: category needs to be created.
+ */
+
+schema.vertexLabel('Platform').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        clusterBy("name",Ascii).
+        create()
+
+/*
+g.addV('Platform').property('tenantId','Default').property('name','Sailpoint')
+g.addV('Platform').property('tenantId','Default').property('name','OIM')
+
+ */
+
+
+--------------------CELL_GREMLIN_8--------------------
+// Before executing this make sure base-schema is created.
+/**
+    //FIXME IAP Category for app type and app onboarding has space in name.
+//    Application Type Onboarding entity.
+*/
+
+schema.vertexLabel('ApplicationTypeDefinition').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        clusterBy('entityKey', Text).
+        property('entityGlobalId', Uuid).
+        property('status', Ascii).
+        property('metaType', Ascii).
+        property('nativeStatus', Ascii).
+        property('updateTime', Timestamp).
+        property('nativeAsOnTime', Timestamp).
+        property('nativeModifiedOnTime', Timestamp).
+        property('createTime', Timestamp).
+        property('nativeId', Text).
+        property('name', Text).
+        property('description', Text).
+        property('ownerUserId', Text).
+        property('data', Text).
+        property('category', Ascii).
+        create()
+
+schema.vertexLabel('ApplicationTypeDefinition').
+        searchIndex().
+        ifNotExists().
+        by('entityKey').asString().
+        by('name').
+        by('status').
+        by('metaType').
+        by('ownerUserId').asString().
+        waitForIndex(30).
+        create()
+
+schema.edgeLabel('Is').
+        ifNotExists().
+        from('ApplicationTypeDefinition').to('Entity').
+        create()
+
+schema.edgeLabel('Is').
+        from('ApplicationTypeDefinition').to('Entity').
+        materializedView('ApplicationTypeDefinition_Is_Entity_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        partitionBy(IN, 'entityGlobalId').
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from("ApplicationTypeDefinition").
+        to("Platform").
+        create()
+
+--------------------CELL_GREMLIN_9--------------------
+/**
+ * Application Onboarding Entity
+ */
+schema.vertexLabel('ApplicationDefinition').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        clusterBy('entityKey', Text).
+        property('entityGlobalId', Uuid).
+        property('status', Ascii).
+        property('metaType', Ascii).
+        property('nativeStatus', Ascii).
+        property('updateTime', Timestamp).
+        property('nativeAsOnTime', Timestamp).
+        property('nativeModifiedOnTime', Timestamp).
+        property('createTime', Timestamp).
+        property('nativeId', Text).
+        property('name', Text).
+        property('description', Text).
+        property('ownerUserId', Text).
+        property('data', Text).
+        property('category', Ascii).
+        create()
+
+schema.vertexLabel('ApplicationDefinition').
+        searchIndex().
+        ifNotExists().
+        by('entityKey').asString().
+        by('name').
+        by('status').
+        by('metaType').
+        by('ownerUserId').asString().
+        waitForIndex(30).
+        create()
+
+schema.edgeLabel('Is').
+        ifNotExists().
+        from('ApplicationDefinition').to('Entity').
+        create()
+
+schema.edgeLabel('Is').
+        from('ApplicationDefinition').to('Entity').
+        materializedView('ApplicationDefinition_Is_Entity_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        partitionBy(IN, 'entityGlobalId').
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from('ApplicationDefinition').
+        to('User').
+        clusterBy('type', Ascii, Asc).
+        property('category', Ascii).
+        property('createTime', Timestamp).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('data', Text).
+        create()
+
+schema.edgeLabel('Is_Related_To').
+        from('ApplicationDefinition').to('User').
+        materializedView('ApplicationDefinition_Actor_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'entityKey').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        clusterBy('type', Asc).
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from("ApplicationDefinition").
+        to("Platform").
+        clusterBy('type', Ascii, Asc).
+        property('category', Ascii).
+        property('createTime', Timestamp).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('data', Text).
+        create()
+
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from('ApplicationDefinition').
+        to('ApplicationTypeDefinition').
+        clusterBy('type', Ascii, Asc).
+        property('category', Ascii).
+        property('createTime', Timestamp).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('data', Text).
+        create()
+
+--------------------CELL_GREMLIN_10--------------------
+/**
+ * Access (User Entitlement Assignment)
+ */
+
+// Load using gremlin console using: following command
+//gremlin> :load /Users/manish/ws/products/dev/iap-adc/adc-root/setup/scripts/cassandra/graph_schema/2-account-schema.groovy
+
+schema.vertexLabel('Access').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        clusterBy('entityKey', Text).
+        property('entityGlobalId', Uuid).
+        property('status', Ascii).
+        property('metaType', Ascii).
+        property('nativeStatus', Ascii).
+        property('updateTime', Timestamp).
+        property('nativeAsOnTime', Timestamp).
+        property('nativeModifiedOnTime', Timestamp).
+        property('createTime', Timestamp).
+        property('nativeId', Text).
+        property('name', Text).
+//        property('description', Text).
+        property('ownerUserId', Text).
+        property('data', Text).
+        property('category', Ascii).
+        create()
+
+//Ensure no searches are made without partitioning key
+schema.vertexLabel('Access').
+        searchIndex().
+        ifNotExists().
+        by('entityKey').asString().
+//        by('name'). //TODO will we ever search access by name, there is not really a good name for access anyways
+        by('status').
+        by('metaType').
+        by('ownerUserId').asString().
+        waitForIndex(5).
+        create()
+
+schema.edgeLabel('Is').
+        ifNotExists().
+        from('Access').to('Entity').
+        create()
+
+//Materialized View
+schema.edgeLabel('Is').
+        from('Access').to('Entity').
+        materializedView('Access_Is_Entity_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        partitionBy(IN, 'entityGlobalId').
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+/**
+ * Relationship between Account and User.
+ * type: owner
+ */
+
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from('Access').to('User').
+        clusterBy('type', Ascii, Asc).
+        property('category', Ascii).
+        property('createTime', Timestamp).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('data', Text).
+        create()
+
+schema.edgeLabel('Is_Related_To').
+        from('Access').to('User').
+        materializedView('Access_Actor_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'entityKey').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        clusterBy('type', Asc).
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+/**
+ * Relationship with Entitlement
+ category = Access_Entitlement
+ type = relationship type name
+ valuePath = SCIM Value path
+
+  ""Entitlement belongs to a different application""
+ */
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from('Access').to('Entitlement').
+        clusterBy('type', Ascii, Asc).
+        property('category', Ascii).
+        property('createTime', Timestamp).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('data', Text).
+        create()
+--------------------CELL_GREMLIN_11--------------------
+/**
+ * IDM_Artifactss: Platform, Application Type, application
+ *
+ */
+
+// Load using gremlin console using: following command
+//gremlin> :load ${GIT_HOME}/iap-adc/adc-root/setup/scripts/cassandra/graph_schema_v2/9-IDM_Artifacts-schema.groovy
+schema.vertexLabel('IDM_Artifacts').
+        ifNotExists().
+        partitionBy('tenantId', Ascii).
+        partitionBy('appId', Ascii).
+        partitionBy('nativeType', Ascii).
+        clusterBy('entityKey', Text).
+        property('entityGlobalId', Uuid).
+        property('status', Ascii).
+        property('metaType', Ascii).
+        property('nativeStatus', Ascii).
+        property('updateTime', Timestamp).
+        property('nativeAsOnTime', Timestamp).
+        property('nativeModifiedOnTime', Timestamp).
+        property('createTime', Timestamp).
+        property('nativeId', Text).
+        property('name', Text).
+        property('description', Text).
+        property('ownerUserId', Text).
+        property('data', Text).
+        property('category', Ascii).
+        create()
+
+schema.vertexLabel('IDM_Artifacts').
+        searchIndex().
+        ifNotExists().
+        by('entityKey').asString().
+        by('name').
+        by('description').asText().
+        by('status').
+        by('metaType').
+        by('updateTime').
+        by('ownerUserId').asString().
+        waitForIndex(5).
+        create()
+
+schema.edgeLabel('Is').
+        ifNotExists().
+        from('IDM_Artifacts').to('Entity').
+        create()
+
+//Materialized View
+schema.edgeLabel('Is').
+        from('IDM_Artifacts').to('Entity').
+        materializedView('IDM_Artifacts_Is_Entity_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        partitionBy(IN, 'entityGlobalId').
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+/** RELATIONSHIP with User
+ category = IDM_Artifacts_Actor
+ type = relationship type name
+ valuePath = SCIM Value path
+ */
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from('IDM_Artifacts').to('User').
+        clusterBy('type', Ascii, Asc).
+        property('category', Ascii).
+        property('createTime', Timestamp).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('data', Text).
+        create()
+
+schema.edgeLabel('Is_Related_To').
+        from('IDM_Artifacts').to('User').
+        materializedView('IDM_Artifacts_Actor_Inverse').
+        ifNotExists().
+        partitionBy(IN, 'tenantId').
+        partitionBy(IN, 'entityKey').
+        partitionBy(IN, 'appId').
+        partitionBy(IN, 'nativeType').
+        clusterBy('type', Asc).
+        clusterBy(OUT, 'tenantId', Asc).
+        clusterBy(OUT, 'appId', Asc).
+        clusterBy(OUT, 'nativeType', Asc).
+        clusterBy(OUT, 'entityKey', Asc).
+        create()
+
+/** Relationship with IDM_Artifacts (Application Type to Application, application to platform)
+ category = IDM_Artifacts_IDM_Artifacts (New!)
+ type = relationship type name
+ valuePath = SCIM Value path
+ */
+schema.edgeLabel('Is_Related_To').
+        ifNotExists().
+        from('IDM_Artifacts').to('IDM_Artifacts').
+        clusterBy('type', Ascii, Asc).
+        property('category', Ascii).
+        property('createTime', Timestamp).
+        property('valuePath', Ascii).
+        property('valueSignature', Text).
+        property('data', Text).
+        create()
+
+--------------------CELL_MARKDOWN_12--------------------
+// Platform Vertices 
+//atask-poem  please review if user have to create "g"  before executing these two statements  
+        
+        g.
+        addV('IDM_Artifacts').
+        property('tenantId', 'Default').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Sailpoint').
+        property('entityKey', 'Sailpoint').
+        property('nativeId', 'Sailpoint').
+        property('category', 'IDM_Artifacts').
+        property('updateTime', Instant.now()).
+  		property('createTime', Instant.now()).
+        property('entityGlobalId', '96ac5ac2-f16a-4fc7-893d-ad3001bb1698' as UUID).
+        property('status', 'Active').
+        property('name', 'Sailpoint').
+        property('description', 'Sailpoint platform vertex')
+       
+     
+        g.
+        addV('IDM_Artifacts').
+        property('tenantId', 'Default').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'OIM').
+        property('entityKey', 'OIM').
+        property('nativeId', 'OIM').
+        property('category', 'IDM_Artifacts').
+        property('updateTime', Instant.now()).
+  		property('createTime', Instant.now()).
+        property('entityGlobalId', 'e9ff7859-bf4b-4209-9de3-37b8cec1f9e3' as UUID).
+        property('status', 'Active').
+        property('name', 'OIM').
+        property('description', 'OIM platform vertex')
+--------------------CELL_GREMLIN_13--------------------
+ // Basic Validations by running the script in bulk, ensure there are no errors. Complete Validation by checking the count and data returned.
+// gremlin> :load /Users/manish/ws/products/dev/iap-adc/adc-root/setup/scripts/cassandra/graph_schema_v2/validation/0-base-validate.groovy
+
+/**
+ * VERTEX
+ */
+
+g.addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('entityKey', 'jdoe').
+        property('nativeId', 'jdoe').
+        property('nativeType', 'inetorgperson').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('status', 'Active').
+        property('name', 'John Doe').
+        iterate();
+
+
+g.addV('Alert').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'inetorgperson').
+        property('ackRequired', true).
+        property('level', 1).
+        property('gid', '03177aa6-97d2-11ea-bb37-0242ac130001').
+        property('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('updateTime', Instant.now()).
+        property('raisedTime', Instant.now()).
+        property('summary', 'summarized message').
+        property('taskId', 34).
+        property('alertType', 'Schemaviolation').
+        property('messages', [['high', 'this a more verbose message']]).
+        iterate();
+
+g.addV('Alert').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'inetorgperson').
+        property('ackRequired', true).
+        property('level', 2).
+        property('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('gid', '03177aa8-97d2-11ea-bb37-0242ac130002').
+        property('raisedTime', Instant.now()).
+        property('updateTime', Instant.now()).
+        property('summary', 'summarized message').
+        property('taskId', 35).
+        property('alertType', 'Schemaviolation').
+        property('messages', [['high', 'this a more verbose message']]).
+        iterate();
+
+g.addV('Event').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'inetorgperson').
+        property('createTime', Instant.now()).
+        property('createTimeBucket', '202007').
+        property('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('gid', '04177aa6-97d2-11ea-bb37-0242ac130002').
+        property('eventCategory', 'StageChange').
+        property('type', 'ModifyEntity').
+        property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        //property('attributes', ['changeLog': 'value']).
+        iterate();
+
+g.addV('Event').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'inetorgperson').
+        property('createTime', Instant.now()).
+        property('createTimeBucket', '202007').
+        property('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('gid', '04177aa6-97d2-11ea-bb37-0242ac130003').
+        property('eventCategory', 'StageChange').
+        property('type', 'ModifyEntity').
+        property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+    //    property('attributes', ['changeLog': 'new value']).
+        iterate();
+
+g.addV('Event').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'inetorgperson').
+        property('createTime', Instant.now()).
+        property('createTimeBucket', '202007').
+        property('entityGlobalId', '82177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('gid', '04177aa6-97d2-11ea-bb37-0242ac130004').
+        property('eventCategory', 'StageChange').
+        property('type', 'ModifyEntity').
+        property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        // property('attributes', ['changeLog': 'new value']).
+        iterate();
+
+g.addV('EntityInstance').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'inetorgperson').
+        property('createTimeBucket', '202007').
+        property('createTime', Instant.now()).
+        property('instanceId', '81177aa6-97d2-11ea-bb37-0242ac130002').
+        property('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('entityKey', 'jdoe').
+        property('nativeId', 'jdoe').
+        property('status', 'Active').
+        property('name', 'John Doe').
+        iterate();
+
+
+
+--------------------CELL_GREMLIN_14--------------------
+/**
+ * EDGES
+ */
+// Entity -> Alert
+g.V().has('Entity', 'appId', "ad").
+has('tenantId', 'tenant1').
+has('nativeType', 'inetorgperson').
+has('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+as("e").V().has('Alert', 'appId', "ad").
+has('tenantId', 'tenant1').
+has('nativeType', 'inetorgperson').as("a").addE('With_Alert').from('e').to('a').
+iterate();
+
+//Entity -> Event
+g.V().has('Entity', 'appId', "ad").has('nativeType', 'inetorgperson').has('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).has('tenantId', 'tenant1').as("entity").
+        V().hasLabel('Event').has('appId', "ad").has('nativeType', 'inetorgperson').has('tenantId', 'tenant1').has('eventCategory', 'StageChange').has('processId','04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('event').
+        addE('With_Event').from('entity').to('event');
+
+// EntityInstance -> Entity
+g.V().has('Entity', 'appId', "ad").has('tenantId', 'tenant1').has('nativeType', 'inetorgperson').has('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as("e").V().has('EntityInstance', 'appId', "ad").has('nativeType', 'inetorgperson').has('tenantId', 'tenant1').has('createTimeBucket', '202007').as("ei").addE('Of_Entity').from('ei').to('e')
+
+/**
+ * QUERY and VALIDATE
+ */
+//Get All Entities of AET: Expected count = 1
+g.V().has('Entity', 'appId', "ad").has('nativeType', 'inetorgperson').has('tenantId', 'tenant1').has('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).valueMap()
+
+//Get all alerts associated with Entity. Expected Count = 2;
+g.V().has('Entity', 'appId', "ad").has('tenantId', 'tenant1').has('nativeType', 'inetorgperson').has('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).out('With_Alert').valueMap()
+
+//Get All entities associated with the alert
+g.V().has('Alert', 'appId', "ad").has('tenantId', 'tenant1').has('nativeType', 'inetorgperson').in('With_Alert')
+
+//Get all events after time t and associated Entity
+g.V().hasLabel('Event').has('appId', "ad").has('nativeType', 'inetorgperson').has('tenantId', 'tenant1').has('createTime', gte(Instant.parse('2015-01-01T00:00:00.00Z'))).has('createTimeBucket', within('202007')).has('eventCategory', within('StageChange')).in('With_Event').valueMap()
+
+
+//Get All EntityInstances in the month of 2020-January of AET
+g.V().has('EntityInstance', 'appId', "ad").has('nativeType', 'inetorgperson').has('tenantId', 'tenant1').has('createTimeBucket', '202007').valueMap()
+
+//Get Entity associated with the instances in the month of 2020-January of AET
+g.V().has('EntityInstance', 'appId', "ad").has('nativeType', 'inetorgperson').has('tenantId', 'tenant1').has('createTimeBucket', '202007').valueMap()
+
+//Get all the entities for which there is atleast one event raised after specified time (t) - todo project entity
+g.V().hasLabel('Event').has('appId', "ad").has('nativeType', 'inetorgperson').has('tenantId', 'tenant1').has('eventCategory', within('StageChange')).has('createTimeBucket', within('202007')).has('createTime', gte(Instant.parse('2015-01-01T00:00:00.00Z'))).group().by('entityGlobalId').by(identity().limit(1))
+
+--------------------CELL_GREMLIN_15--------------------
+/**
+ * SAMPLE DATA
+ */
+
+g.addV('User').
+        property('tenantId', 'tenant1').
+        property('appId', 'User Identities').
+        property('entityKey', 'JDOE').
+        property('nativeId', 'jdoe').
+        property('nativeType', 'Identity').
+        property('metaType', 'User').
+        property('userType', 'Employee').
+        property('category', 'User').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '91177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('status', 'Active').
+        property('nativeStatus', 'Disabled').
+        property('name', 'John Doe').
+        property('displayName', 'John').as("p").
+        iterate();
+
+        addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'User Identities').
+        property('entityKey', 'JDOE').
+        property('nativeId', 'jdoe').
+        property('nativeType', 'Identity').
+        property('metaType', 'User').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '91177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('status', 'Active').
+        property('nativeStatus', 'Disabled').
+        property('name', 'John Doe').
+        property('data', '{"displayName": "John"}').as("e").
+        addE('Is').from("p").to("e").
+        iterate();
+
+
+
+--------------------CELL_GREMLIN_16--------------------
+/**
+ * VALIDATE
+ */
+//Lookup User
+g.V().hasLabel('User').has('entityKey', 'JDOE').has('tenantId', 'tenant1').valueMap()
+g.V().hasLabel('User').has('entityKey', 'JDOE').has('tenantId', 'tenant1').valueMap()
+--------------------CELL_GREMLIN_17--------------------
+/**
+ * Sample Data
+ */
+g.
+        addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'groupOfUniqueNames').
+        property('entityKey', 'GROUP1').
+        property('nativeId', 'Group1').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '21174aa6-17d2-41ea-bb37-0242ac130001' as UUID).
+        property('status', 'Active').
+        property('name', 'Group 1').
+        property('data', '{"Name":"Group1", "Description":"desc"}').as("entity").
+        iterate();
+        
+        addV('Entitlement').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'groupOfUniqueNames').
+        property('entityKey', 'GROUP1').
+        property('nativeId', 'Group1').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '21174aa6-17d2-41ea-bb37-0242ac130001' as UUID).
+        property('status', 'Active').
+        property('name', 'Group 1').
+        property('displayName', 'Group 1').
+        property('data', '{"Name":"Group1", "Description":"desc"}').
+        property('ownerUserId', 'BHARAT').
+        property('description', 'desc').as("entitlement").
+        iterate();
+        
+        addE('Is').from('entitlement').to('entity').
+        iterate();
+        
+        addV('Alert').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'groupOfUniqueNames').
+        property('level', 1).
+        property('entityGlobalId', '21174aa6-17d2-41ea-bb37-0242ac130001' as UUID).
+        property('gid', '08177aa6-87d2-11ea-ab37-0242ac110001').
+        property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('updateTime', Instant.now()).
+        property('raisedTime', Instant.now()).
+        property('alertType', 'Info').
+        property('taskId', 10).
+        property('taskName', "Description Validations").
+        property('summary', 'Description is non-descriptive').as('alert').
+        iterate();
+        
+        addE('With_Alert').from('entity').to('alert').iterate();
+        
+        addV('Event').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'groupOfUniqueNames').
+        property('createTimeBucket', '202007').
+        property('createTime', Instant.now()).
+        property('entityGlobalId', '21174aa6-17d2-41ea-bb37-0242ac130001' as UUID).
+        property('gid', '09177aa6-17e2-11ea-bb37-0242ac130098').
+        property('eventCategory', 'StageChange').
+        property('type', 'ModifyEntity').
+        property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('event').
+        iterate();
+        
+        addE('With_Event').from('entity').to('event').iterate();
+
+//Entitlement -> User
+g.
+        addV('Entitlement').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'groupOfUniqueNames').
+        property('entityKey', 'GROUP1').as('entitlement').
+        iterate();
+        
+        addV('User').
+        property('tenantId', 'tenant1').
+        property('entityKey', 'JDOE').
+        property('appId', 'User Identities').
+        property('nativeType', 'Identity').as('user').
+        iterate();
+        
+        addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'User Identities').
+        property('entityKey', 'JDOE').
+        property('nativeType', 'Identity').
+        property('nativeId', 'jdoe').
+        property('entityGlobalId', '91177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('personEntity').
+        iterate();
+        
+        addE('Is').from("user").to("personEntity").iterate();
+        
+        addE('Is_Related_To').from('entitlement').to('user').property('type', "Entitlement Certifier User").iterate();
+
+
+
+--------------------CELL_GREMLIN_18--------------------
+//Get All Entitlements of AET
+g.V().hasLabel('Entitlement').has('appId', "ad").has('nativeType', 'groupOfUniqueNames').has('tenantId', 'tenant1').valueMap().iterate();
+
+//Lookup entitlement's generic entity
+g.V().has('Entitlement', 'appId', "ad").has('nativeType', 'groupOfUniqueNames').has('entityKey', 'GROUP1').has('tenantId', 'tenant1').as("ent").out('Is').valueMap()
+
+// create Alert
+
+
+// List Alerts raised on the entitlement
+g.V().has('Entitlement', 'appId', "ad").has('tenantId', 'tenant1').has('nativeType', 'groupOfUniqueNames').has('entityKey', 'GROUP1').out('Is').out('With_Alert').valueMap()
+
+
+//get entity by event? using materialized view
+g.V().hasLabel('Event').has('appId', "ad").has('nativeType', 'groupOfUniqueNames').has('createTimeBucket', '202007').has('tenantId', 'tenant1').has('eventCategory', within('StageChange')).has('createTime', gte(Instant.parse('2015-01-01T00:00:00.00Z'))).in('With_Event').in('Is').hasLabel('Entitlement').valueMap()
+
+//get all actors associated with the Entitlement
+g.V().has('Entitlement', 'appId', "ad").has('nativeType', 'groupOfUniqueNames').has('tenantId', 'tenant1').out('Is_Related_To').hasLabel('User').valueMap()
+
+
+--------------------CELL_GREMLIN_19--------------------
+g.V().profile();
+--------------------CELL_GREMLIN_20--------------------
+g.
+        addV('Account').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'inetorgperson').
+        property('entityKey', 'jdoe').
+        property('nativeId', 'jdoe').
+        property('category', 'Account').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('status', 'Active').
+        property('data', '{"Name":"Group1", "Description":"desc"}').
+        property('ownerUserId', 'BHARAT').
+        property('name', 'John Doe').as('account').iterate();
+        
+        addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('entityKey', 'jdoe').
+        property('nativeId', 'jdoe').
+        property('nativeType', 'inetorgperson').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('status', 'Active').
+        property('name', 'John Doe').as('accountEntity').iterate();
+        
+        addE('Is').from('account').to('accountEntity').iterate();
+        
+        addV('Alert').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'inetorgperson').
+        property('level', 1).
+        property('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('gid', '08177aa7-87d2-11ea-ab37-0242ac110001').
+        property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('updateTime', Instant.now()).
+        property('raisedTime', Instant.now()).
+        property('alertType', 'Info').
+        property('taskId', 10).
+        property('taskName', "Description Validations").
+        property('summary', 'Description is non-descriptive').as('alert').iterate();
+        
+        addE('With_Alert').from('accountEntity').to('alert').iterate();
+        
+        addV('Event').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'inetorgperson').
+        property('createTimeBucket', '202007').
+        property('createTime', Instant.now()).
+        property('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('gid', '08177aa7-87d2-11ea-ab37-0242ac110001').
+        property('eventCategory', 'StageChange').
+        property('type', 'ModifyEntity').
+        property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('event').iterate();
+        
+        addE('With_Event').from('accountEntity').to('event').iterate();
+
+//Account -> User
+g.
+        addV('Account').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'inetorgperson').
+        property('entityKey', 'jdoe').as('account').iterate();
+        
+        addV('User').
+        property('tenantId', 'tenant1').
+        property('entityKey', 'JDOE').
+        property('appId', 'User Identities').
+        property('nativeType', 'Identity').as('user').iterate();
+        
+        addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'User Identities').
+        property('entityKey', 'JDOE').
+        property('nativeType', 'Identity').
+        property('nativeId', 'jdoe').
+        property('entityGlobalId', '91177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('personEntity').iterate();
+        
+        addE('Is').from("user").to("personEntity").iterate();
+        
+        addE('Is_Related_To').from('account').to('user').property('type', "Owner").iterate();
+        
+        addV('Entitlement').
+        property('tenantId', 'tenant1').
+        property('appId', 'ad').
+        property('nativeType', 'groupOfUniqueNames').
+        property('entityKey', 'GROUP1').as('entitlement').
+        addE('Is_Related_To').from('account').to('entitlement').property('type', "has").iterate();
+
+--------------------CELL_GREMLIN_21--------------------
+
+//Traverse from Account to Entity
+g.V().has('Account', 'appId', "ad").has('nativeType', 'inetorgperson').has('entityKey', 'jdoe').has('tenantId', 'tenant1').as("account").out('Is').valueMap()
+
+//Traverse from entity to Account
+g.V().has('Entity', 'appId', "ad").has('nativeType', 'inetorgperson').has('entityGlobalId', '81177aa6-97d2-11ea-bb37-0242ac130002' as UUID).has('tenantId', 'tenant1').as("entity").in('Is').valueMap()
+
+// Account -> Entity -> Alert
+g.V().has('Account', 'appId', "ad").has('tenantId', 'tenant1').has('nativeType', 'inetorgperson').has('entityKey', 'jdoe').out('Is').out('With_Alert').valueMap()
+
+// Account -> Entity -> Event
+g.V().has('Account', 'appId', "ad").has('tenantId', 'tenant1').has('nativeType', 'inetorgperson').has('entityKey', 'jdoe').out('Is').out('With_Event').valueMap()
+
+// Event -> Entity -> Account
+g.V().hasLabel('Event').has('appId', "ad").has('nativeType', 'inetorgperson').has('tenantId', 'tenant1').has('createTimeBucket', '202007').has('eventCategory', within('StageChange')).has('createTime', gte(Instant.parse('2015-01-01T00:00:00.00Z'))).in('With_Event').in('Is').valueMap()
+
+
+// Account -> Person
+g.
+        V().has('Account', 'appId', "ad").has('nativeType', 'inetorgperson').has('tenantId', 'tenant1').has('entityKey', 'jdoe').
+        outE('Is_Related_To').valueMap()
+
+g.V().hasLabel('User').has('entityKey', 'JDOE').has('tenantId', 'tenant1').inE('Is_Related_To').has('type', 'Owner').outV().valueMap()
+
+
+//List of Entitlements
+g.V().has('Account', 'appId', "ad").has('nativeType', 'inetorgperson').has('tenantId', 'tenant1').has('entityKey', 'jdoe').as("account").out('Is_Related_To').hasLabel('Entitlement').valueMap()
+--------------------CELL_GREMLIN_22--------------------
+g.addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Role Definition').
+        property('nativeType', 'Role').
+        property('entityKey', '1234').
+        property('nativeId', 'IAP Dev Role').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('status', 'Active').
+        property('data', '{"Role Name":"IAP Dev Role", "Description":"This role gives access to iap git branches"}').
+        property('name', 'IAP Developer Role').as("entity").iterate();
+
+        addV('Role').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Role Definition').
+        property('nativeType', 'Role').
+        property('nativeId', 'IAP Dev Role').
+        property('entityKey', '1234').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('status', 'Active').
+        property('name', 'IAP Developer Role').
+        property('displayName', 'IAP Developer Role').
+        property('data', '{"Role Name":"IAP Dev Role", "Description":"This role gives access to iap git branches"}').
+        property('ownerUserId', 'BHARAT').
+        property('description', 'This role gives access to iap git branches').as('role').iterate();
+
+        addE('Is').from('role').to('entity').iterate();
+
+        addV('Alert').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Role Definition').
+        property('nativeType', 'Role').
+        property('level', 1).
+        property('gid', '06177ea6-87b2-11ea-ab37-0242ac110007').
+        property('entityGlobalId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('updateTime', Instant.now()).
+        property('raisedTime', Instant.now()).
+        property('alertType', 'Info').
+        property('taskId', 10).
+        property('taskName', "Description Validations").
+        property('summary', 'Description should be more descriptive').as('alert').iterate();
+
+        addE('With_Alert').from('entity').to('alert').iterate();
+
+        addV('Event').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Role Definition').
+        property('nativeType', 'Role').
+        property('createTime', Instant.now()).
+        property('createTimeBucket', '202007').
+        property('entityGlobalId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('gid', '03177aa6-17b2-11ea-bb37-0242ac130098').
+        property('eventCategory', 'StageChange').
+        property('type', 'ModifyEntity').
+        property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('event1').
+        addE('With_Event').from('entity').to('event1').iterate();
+
+        addV('Event').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Role Definition').
+        property('nativeType', 'Role').
+        property('createTimeBucket', '202007').
+        property('createTime', Instant.now()).
+        property('entityGlobalId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('gid', '01177ab5-17b2-11ea-bb37-0241ac130091').
+        property('eventCategory', 'EntityTypeConversion').
+        property('type', 'ConvertToServiceAccount').
+        property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('event2').iterate();
+        
+        addE('With_Event').from('entity').to('event2').iterate();
+
+//Role  -> User
+g.addV('Role').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Role Definition').
+        property('nativeType', 'Role').
+        property('entityKey', '1234').as('role').iterate();
+
+        addV('User').
+        property('tenantId', 'tenant1').
+        property('entityKey', 'JDOE').
+        property('appId', 'User Identities').
+        property('nativeType', 'Identity').as('person').iterate();
+
+        addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'User Identities').
+        property('entityKey', 'JDOE').
+        property('nativeType', 'Identity').
+        property('nativeId', 'jdoe').
+        property('entityGlobalId', '91177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('personEntity').iterate();
+
+        addE('Is').from("person").to("personEntity").iterate();
+
+        addE('Is_Related_To').from('role').to('person').property('type', 'Owner').iterate();
+
+--------------------CELL_GREMLIN_23--------------------
+
+//Get All Roles
+g.V().hasLabel('Role').has('appId', 'CAMR-Role Definition').has('nativeType', 'Role').has('tenantId', 'tenant1').valueMap()
+
+//Lookup role's generic entity
+g.V().has('Role', 'appId', 'CAMR-Role Definition').has('nativeType', 'Role').has('entityKey', '1234').has('tenantId', 'tenant1').as('role').out('Is').valueMap()
+
+// List Alerts raised on the Role
+g.V().has('Role', 'appId', 'CAMR-Role Definition').has('nativeType', 'Role').has('entityKey', '1234').has('tenantId', 'tenant1').as('role').out('Is').out('With_Alert').valueMap()
+
+//get entity by event? using materialized view
+g.V().hasLabel('Event').has('appId', 'CAMR-Role Definition').has('nativeType', 'Role').has('createTimeBucket', '202007').has('tenantId', 'tenant1').has('eventCategory', within('StageChange')).has('createTime', gte(Instant.parse('2015-01-01T00:00:00.00Z'))).in('With_Event').in('Is').valueMap()
+
+//get all actors associated with the Role
+g.V().has('Role', 'appId', 'CAMR-Role Definition').has('nativeType', 'Role').has('tenantId', 'tenant1').out('Is_Related_To').hasLabel('User').valueMap()
+--------------------CELL_GREMLIN_24--------------------
+
+//create platforms
+        g.
+        addV('Platform').
+        property('tenantId', 'tenant1').
+        property('name', 'Sailpoint').iterate();
+
+        g.addV('Platform').
+        property('tenantId', 'tenant1').
+        property('name', 'OIM').iterate();
+
+
+
+--------------------CELL_GREMLIN_25--------------------
+//query platforms
+        g.V().hasLabel('Platform').
+                has('tenantId', 'tenant1').
+                has('name', 'Sailpoint');
+--------------------CELL_GREMLIN_26--------------------
+/**
+ * load Application Type Entity with alerts and event
+ */
+
+    g.addV('Entity').
+    property('tenantId', 'tenant1').
+    property('appId', 'CAMR-Application Configuration').
+    property('nativeType', 'Disconnected Application Type').
+    property('entityKey', 'ADC Generic Application Type').
+    property('nativeId', 'ADC Generic Application Type').
+    property('updateTime', Instant.now()).
+    property('entityGlobalId', UUID.fromString("93e09027-cdf8-4c51-aeb9-1e9eb375f0b4")).
+    property('status', 'Active').
+    property('name', 'ADC Generic Application Type').
+    property('data', '{"Application Type Name":"ADC Generic Application","Sailpoint":{"Template":"Disconnected Salesforce Template App Type","Operations":[{"Entity Type Name":"Account","Operation Name":"Create"},{"Entity Type Name":"Account","Operation Name":"Update"}]},"Entity Types":[{"Relationships":{"Groups":{"Relationship Category":"Account_Entitlement","Related Entity Type Name":"Groups","Matching Rule":{"===":[{"var":"domain@Groups/Group"},{"var":"range@$identifier"}]}},"Owner":{"Relationship Category":"With_Actor","Matching Rule":{"===":[{"var":"domain@Account Login"},{"var":"range@UserName"}]}}},"Category":"Account","Entity Type Name":"Account","Schema":{"$schema":"http://json-schema.org/draft-07/schema#","title":"Account","type":"object","properties":{"Account Id":{"type":"string","title":"Account ID","description":"Account id, it must be a unique value.","$extension":{"isIdentifier":true,"isNativeId":true}},"Account Login":{"type":"string","title":"Account Login","description":"account login attribute.","$extension":{"isNameAttribute":true}},"Status":{"title":"Status","description":"Attribute to represent the status of account.","type":"string","$extension":{"isStatus":true}},"Active":{"title":"Active","description":"Activate of account","type":"boolean"},"Activate Time":{"type":"number","description":"Activation Time","title":"Activation Time"},"Groups":{"type":"array","title":"Groups","description":"Groups which are associated with the give account","items":[{"type":"object","properties":{"Group":{"type":"string","$extension":{"isIdentifier":true}}}}]}},"required":["Account Id","Account Login"]}},{"Entity Type Name":"Groups","Category":"Entitlement","Schema":{"$schema":"http://json-schema.org/draft-07/schema#","title":"Groups","type":"object","properties":{"Group":{"$extension":{"isIdentifier":true,"isNativeId":true},"type":"string"}},"required":["Group"]}}],"Description":"Application Type using AVID in correlation rul","Target System Category":"Business Application"}').
+    as('entity').iterate();
+
+    addV('ApplicationTypeDefinition').
+    property('tenantId','tenant1').
+    property('appId','CAMR-Application Configuration').
+    property('nativeType','Disconnected Application Type').
+    property('entityKey','ADC Generic Application Type').
+    property('category','Application Type Definition').
+    property('entityGlobalId',UUID.fromString("93e09027-cdf8-4c51-aeb9-1e9eb375f0b4")).
+    property('status','Active').
+    property('nativeId','ADC Generic Application Type').
+    property('createTime',Instant.now()).
+    property('updateTime',Instant.now()).
+    property('name','ADC Generic Application Type').
+    property('description','Application Type Data').
+    property('data', '{"Application Type Name":"ADC Generic Application","Sailpoint":{"Template":"Disconnected Salesforce Template App Type","Operations":[{"Entity Type Name":"Account","Operation Name":"Create"},{"Entity Type Name":"Account","Operation Name":"Update"}]},"Entity Types":[{"Relationships":{"Groups":{"Relationship Category":"Account_Entitlement","Related Entity Type Name":"Groups","Matching Rule":{"===":[{"var":"domain@Groups/Group"},{"var":"range@$identifier"}]}},"Owner":{"Relationship Category":"With_Actor","Matching Rule":{"===":[{"var":"domain@Account Login"},{"var":"range@UserName"}]}}},"Category":"Account","Entity Type Name":"Account","Schema":{"$schema":"http://json-schema.org/draft-07/schema#","title":"Account","type":"object","properties":{"Account Id":{"type":"string","title":"Account ID","description":"Account id, it must be a unique value.","$extension":{"isIdentifier":true,"isNativeId":true}},"Account Login":{"type":"string","title":"Account Login","description":"account login attribute.","$extension":{"isNameAttribute":true}},"Status":{"title":"Status","description":"Attribute to represent the status of account.","type":"string","$extension":{"isStatus":true}},"Active":{"title":"Active","description":"Activate of account","type":"boolean"},"Activate Time":{"type":"number","description":"Activation Time","title":"Activation Time"},"Groups":{"type":"array","title":"Groups","description":"Groups which are associated with the give account","items":[{"type":"object","properties":{"Group":{"type":"string","$extension":{"isIdentifier":true}}}}]}},"required":["Account Id","Account Login"]}},{"Entity Type Name":"Groups","Category":"Entitlement","Schema":{"$schema":"http://json-schema.org/draft-07/schema#","title":"Groups","type":"object","properties":{"Group":{"$extension":{"isIdentifier":true,"isNativeId":true},"type":"string"}},"required":["Group"]}}],"Description":"Application Type using AVID in correlation rul","Target System Category":"Business Application"}').
+    property('ownerUserId', 'BHARAT').
+    as('apptype').iterate();
+
+    addE('Is').from('apptype').to('entity').iterate();
+
+    addV('Alert').
+    property('tenantId', 'tenant1').
+    property('appId', 'CAMR-Application Configuration').
+    property('nativeType', 'Disconnected Application Type').
+    property('level', 1).
+    property('entityGlobalId', '93e09027-cdf8-4c51-aeb9-1e9eb375f0b4' as UUID).
+    property('gid', '08178da6-87d2-11ea-ab37-0242ac110001').
+    property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+    property('updateTime', Instant.now()).
+    property('raisedTime', Instant.now()).
+    property('alertType', 'Info').
+    property('taskId', 10).
+    property('taskName', "Description Validations").
+    property('summary', 'Description is non-descriptive').as('alert').
+    addE('With_Alert').from('entity').to('alert').iterate();
+
+    addV('Event').
+     property('tenantId', 'tenant1').
+     property('appId', 'CAMR-Application Configuration').
+     property('nativeType', 'Disconnected Application Type').
+     property('createTimeBucket', '202007').
+     property('createTime', Instant.now()).
+     property('entityGlobalId', '93e09027-cdf8-4c51-aeb9-1e9eb375f0b4' as UUID).
+     property('gid', 'e7d0b447-9926-45da-b0b5-5942ef02e54d').
+     property('eventCategory', 'StageChange').
+     property('type', 'CreateEvent').
+     property('processId', 'd3799f13-9722-48a6-a7ff-76344054f25e' as UUID).
+    as('event').iterate();
+
+    addE('With_Event').from('entity').to('event').iterate();
+
+    
+--------------------CELL_GREMLIN_27--------------------
+//Get All App types
+    g.V().hasLabel('ApplicationTypeDefinition').has('appId', "CAMR-Application Configuration").has('nativeType', 'Disconnected Application Type').has('tenantId', 'tenant1').valueMap()
+
+    //Lookup App Type's generic entity
+    g.V().hasLabel('ApplicationTypeDefinition').has('appId', "CAMR-Application Configuration").has('nativeType', 'Disconnected Application Type').has('entityKey', 'ADC Generic Application Type').has('tenantId', 'tenant1').as("ent").out('Is').valueMap()
+
+    g.V().hasLabel('ApplicationTypeDefinition').has('appId', "CAMR-Application Configuration").has('nativeType', 'Disconnected Application Type').has('entityKey', 'ADC Generic Application Type').has('tenantId', 'tenant1').out('Is').out('With_Alert').valueMap()
+
+    //get entity by event? using materialized view
+    g.V().hasLabel('Event').has('appId', "CAMR-Application Configuration").has('nativeType', 'Disconnected Application Type').has('createTimeBucket', '202007').has('tenantId', 'tenant1').has('eventCategory', within('StageChange')).has('createTime', gte(Instant.parse('2015-01-01T00:00:00.00Z'))).in('With_Event').in('Is').valueMap()
+--------------------CELL_GREMLIN_28--------------------
+/**
+ * create app vertex  with alerts and events
+ */
+
+g.addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Business Application').
+        property('entityKey', 'CAMR-Okta').
+        property('nativeId', 'CAMR-Okta').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', UUID.fromString("93e09027-cdf8-4c51-aeb0-1e9eb375f0b4")).
+        property('status', 'Active').
+        property('name', 'CAMR-Okta').
+        property('data', '{"Owner":"PBULE","Application Type Name":"ADC Generic Application Type","Application Name":"Okta","Application Identifier":"CAMR-Okta"}').
+        as('entity').iterate();
+
+        addV('ApplicationDefinition').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Business Application').
+        property('entityKey', 'CAMR-Okta').
+        property('category', 'Application Definition').
+        property('entityGlobalId', UUID.fromString("93e09027-cdf8-4c51-aeb0-1e9eb375f0b4")).
+        property('status', 'Active').
+        property('nativeId', 'CAMR-Okta').
+        property('updateTime', Instant.now()).
+        property('createTime', Instant.now()).
+        property('name', 'CAMR-Okta').
+        property('description', 'Okta Application').
+        property('data', '{"Owner":"PBULE","Application Type Name":"ADC Generic Application Type","Application Name":"Okta","Application Identifier":"CAMR-Okta"}').
+        property('ownerUserId', 'BHARAT').
+        as('app').iterate();
+
+        addE('Is').from('app').to('entity').iterate();
+
+        addV('Alert').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Business Application').
+        property('level', 1).
+        property('entityGlobalId', '93e09027-cdf8-4c51-aeb0-1e9eb375f0b4' as UUID).
+        property('gid', '06177aa6-87d2-11ea-aee37-0242ac110008').
+        property('processId', '04177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('updateTime', Instant.now()).
+        property('raisedTime', Instant.now()).
+        property('alertType', 'Info').
+        property('taskId', 10).
+        property('taskName', "Description Validations").
+        property('summary', 'Description is non-descriptive').as('alert').iterate();
+
+        addE('With_Alert').from('entity').to('alert').iterate();
+
+        addV('Event').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Business Application').
+        property('createTimeBucket', '202007').
+        property('createTime', Instant.now()).
+        property('entityGlobalId', '93e09027-cdf8-4c51-aeb0-1e9eb375f0b4' as UUID).
+        property('gid', 'e7d0b557-9926-45da-b0b5-5942ef02e54d').
+        property('eventCategory', 'StageChange').
+        property('type', 'CreateEvent').
+        property('processId', 'd3799f13-9722-48a6-a7ff-76344054f25e' as UUID).as('event').iterate();
+        addE('With_Event').from('entity').to('event').iterate();
+
+//app -Owner-> User
+g.
+        addV('ApplicationDefinition').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Business Application').
+        property('entityKey', 'CAMR-Okta').
+        as('app').iterate();
+
+        addV('User').
+        property('tenantId', 'tenant1').
+        property('entityKey', 'JDOE').as('User').
+        property('appId', 'User Identities').
+        property('nativeType', 'Identity').as('user').iterate();
+
+        addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'User Identities').
+        property('sentityKey', 'JDOE').
+        property('nativeType', 'Identity').
+        property('nativeId', 'jdoe').
+        property('entityGlobalId', '91177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('personEntity').iterate();
+
+        addE('Is').from("user").to("personEntity").iterate();
+
+        addE('Is_Related_To').from('app').to('User').property('type', 'Owner').iterate();
+
+//app -> app type
+g.
+        addV('ApplicationDefinition').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Business Application').
+        property('entityKey', 'CAMR-Okta').
+        as('app').iterate();
+        
+        addV('ApplicationTypeDefinition').
+        property('tenantId','tenant1').
+        property('appId','CAMR-Application Configuration').
+        property('nativeType','Disconnected Application Type').
+        property('entityKey','ADC Generic Application Type').
+        as('apptype').iterate();
+        
+        addE('Is_Related_To').from('app').to('apptype').property('type','ApplicationType_Application').iterate();
+
+
+--------------------CELL_GREMLIN_29--------------------
+//Get All apps
+g.V().hasLabel('ApplicationDefinition').has('appId', 'CAMR-Application Configuration').has('nativeType', 'Business Application').has('tenantId', 'tenant1').valueMap()
+
+//Lookup application's generic entity
+g.V().hasLabel('ApplicationDefinition').has('appId', 'CAMR-Application Configuration').has('nativeType', 'Business Application').has('entityKey', 'CAMR-Okta').has('tenantId', 'tenant1').as("app").out('Is').valueMap()
+
+
+// List Alerts raised on the entitlement
+g.V().hasLabel('ApplicationDefinition').has('appId', 'CAMR-Application Configuration').has('nativeType', 'Business Application').has('entityKey', 'CAMR-Okta').out('Is').out('With_Alert').valueMap()
+
+
+//get entity by event? using materialized view
+g.V().hasLabel('Event').has('appId', 'CAMR-Application Configuration').has('nativeType', 'Business Application').has('createTimeBucket', '202007').has('tenantId', 'tenant1').has('eventCategory', within('StageChange')).has('createTime', gte(Instant.parse('2015-01-01T00:00:00.00Z'))).in('With_Event').in('Is').valueMap()
+
+//get all actors associated with the Entitlement
+g.V().hasLabel('ApplicationDefinition').has('appId', 'CAMR-Application Configuration').has('nativeType', 'Business Application').out('Is_Related_To').hasLabel('User').valueMap()
+
+//related app type
+g.V().hasLabel('ApplicationDefinition').has('appId', 'CAMR-Application Configuration').has('nativeType', 'Business Application').has('tenantId', 'tenant1').has('entityKey', 'CAMR-Okta').as("app").out('Is_Related_To').hasLabel('ApplicationTypeDefinition').valueMap()
+--------------------CELL_GREMLIN_30--------------------
+
+
+g.
+        addV('Access').
+        property('tenantId', 'tenant1').
+        property('appId', 'PlatformAccess').
+        property('nativeType', 'Unix Platform Access').
+        property('entityKey', '8a819b536a00e7e4016a01a0fadf0616').
+        property('nativeId', '8a819b536a00e7e4016a01a0fadf0616').
+        property('category', 'Access').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '51177aa6-97d2-11ea-bb37-0242ac110006' as UUID).
+        property('status', 'Active').
+        property('name', '8a819b536a00e7e4016a01a0fadf0616').
+        property('data', '{"Owner":"BHARAT"}').
+        property('ownerUserId', 'BHARAT').
+        as('access').iterate();
+
+        addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'PlatformAccess').
+        property('nativeType', 'Unix Platform Access').
+        property('entityKey', '8a819b536a00e7e4016a01a0fadf0616').
+        property('nativeId', '8a819b536a00e7e4016a01a0fadf0616').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '51177aa6-97d2-11ea-bb37-0242ac110006' as UUID).
+        property('status', 'Active').
+        property('name', '8a819b536a00e7e4016a01a0fadf0616').
+        as('entity').iterate();
+
+        addE('Is').from('access').to('entity').iterate();
+
+        addV('Alert').
+        property('tenantId', 'tenant1').
+        property('appId', 'PlatformAccess').
+        property('nativeType', 'Unix Platform Access').
+        property('level', 1).
+        property('entityGlobalId', '51177aa6-97d2-11ea-bb37-0242ac110006' as UUID).
+        property('gid', '02177aa7-87d2-11ea-ab37-0242ac110023').
+        property('processId', '02177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('updateTime', Instant.now()).
+        property('raisedTime', Instant.now()).
+        property('alertType', 'Info').
+        property('taskId', 10).
+        property('taskName', "Cluster Anlaysis").
+        property('summary', 'excessive access').
+        as('alert').iterate();
+
+        addE('With_Alert').from('entity').to('alert').iterate();
+
+        addV('Event').
+        property('tenantId', 'tenant1').
+        property('appId', 'PlatformAccess').
+        property('nativeType', 'Unix Platform Access').
+        property('createTimeBucket', '202007').
+        property('createTime', Instant.now()).
+        property('entityGlobalId', '51177aa6-97d2-11ea-bb37-0242ac110006' as UUID).
+        property('gid', '02177aa7-87d2-11ea-ab37-0242ac110006').
+        property('eventCategory', 'StageChange').
+        property('type', 'ModifyEntity').
+        property('processId', '02177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('event').iterate();
+        
+        addE('With_Event').from('entity').to('event').iterate();
+
+g.
+        addV('Access').
+        property('tenantId', 'tenant1').
+        property('appId', 'PlatformAccess').
+        property('nativeType', 'Unix Platform Access').
+        property('entityKey', '8a819b536a00e7e4016a01a0fadf0616').
+        as('access').iterate();
+
+        addV('User').
+        property('tenantId', 'tenant1').
+        property('entityKey', 'JDOE').as('User').
+        property('appId', 'User Identities').
+        property('nativeType', 'Identity').as('user').
+        property('appId', 'User Identities').
+        property('nativeType', 'Identity').iterate();
+        
+        addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'User Identities').
+        property('entityKey', 'JDOE').
+        property('nativeType', 'Identity').
+        property('nativeId', 'jdoe').
+        property('entityGlobalId', '91177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('userEntity').iterate();
+
+        addE('Is').from("user").to("userEntity").iterate();
+
+        addE('Is_Related_To').from('access').to('User').property('type', "Owner").iterate();
+
+        addV('Entitlement').
+        property('tenantId', 'tenant1').
+        property('appId', 'pset').
+        property('nativeType', 'Platform Permission Set').
+        property('entityKey', 'Pset1').
+        property('name', 'Permission Set 1').
+        as('entitlement').iterate();
+        
+        addE('Is_Related_To').from('access').to('entitlement').property('type', "has").iterate();
+
+
+--------------------CELL_GREMLIN_31--------------------
+//Traverse from Access to Entity
+g.V().has('Access', 'appId', "PlatformAccess").has('nativeType', 'Unix Platform Access').has('entityKey', '8a819b536a00e7e4016a01a0fadf0616').has('tenantId', 'tenant1').as("access").out('Is').valueMap()
+
+//Traverse from entity to Access
+g.V().has('Entity', 'appId', "PlatformAccess").has('nativeType', 'Unix Platform Access').has('entityGlobalId', '51177aa6-97d2-11ea-bb37-0242ac110006' as UUID).has('tenantId', 'tenant1').as("entity").in('Is').valueMap()
+
+// Access -> Entity -> Alert
+g.V().has('Access', 'appId', "PlatformAccess").has('tenantId', 'tenant1').has('nativeType', 'Unix Platform Access').has('entityKey', '8a819b536a00e7e4016a01a0fadf0616').out('Is').out('With_Alert').valueMap()
+
+// Access -> Entity -> Event
+g.V().has('Access', 'appId', "PlatformAccess").has('tenantId', 'tenant1').has('nativeType', 'Unix Platform Access').has('entityKey', '8a819b536a00e7e4016a01a0fadf0616').out('Is').out('With_Event').valueMap()
+
+//TODO following query returns duplicate.
+// Event -> Entity -> Account
+g.V().hasLabel('Event').has('appId', "PlatformAccess").has('nativeType', 'Unix Platform Access').has('tenantId', 'tenant1').has('createTimeBucket', '202007').has('eventCategory', within('StageChange')).has('createTime', gte(Instant.parse('2015-01-01T00:00:00.00Z'))).in('With_Event').in('Is').valueMap()
+
+// Access -> Person
+g.V().has('Access', 'appId', "PlatformAccess").has('tenantId', 'tenant1').has('nativeType', 'Unix Platform Access').has('entityKey', '8a819b536a00e7e4016a01a0fadf0616').out('Is_Related_To').hasLabel('User').valueMap()
+
+//Access ->  Entitlement
+g.V().has('Access', 'appId', "PlatformAccess").has('tenantId', 'tenant1').has('nativeType', 'Unix Platform Access').has('entityKey', '8a819b536a00e7e4016a01a0fadf0616').as("access").out('Is_Related_To').hasLabel('Entitlement').valueMap()
+--------------------CELL_GREMLIN_32--------------------
+
+g.
+        addV('IDM_Artifacts').
+        property('tenantId', 'Default').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Sailpoint').
+        property('entityKey', 'Sailpoint').
+        property('nativeId', 'Sailpoint').
+        property('category', 'IDM_Artifacts').
+        property('updateTime', Instant.now()).
+  		property('createTime', Instant.now()).
+        property('entityGlobalId', '96ac5ac2-f16a-4fc7-893d-ad3001bb1698' as UUID).
+        property('status', 'Active').
+        property('name', 'Sailpoint').
+        property('description', 'Sailpoint platform vertex').
+        property('data', '{"Owner":"BHARAT"}').
+        property('ownerUserId', 'BHARAT').iterate();
+     
+g.
+        addV('IDM_Artifacts').
+        property('tenantId', 'Default').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'OIM').
+        property('entityKey', 'OIM').
+        property('nativeId', 'OIM').
+        property('category', 'IDM_Artifacts').
+        property('updateTime', Instant.now()).
+  		property('createTime', Instant.now()).
+        property('entityGlobalId', 'e9ff7859-bf4b-4209-9de3-37b8cec1f9e3' as UUID).
+        property('status', 'Active').
+        property('name', 'OIM').
+        property('description', 'OIM platform vertex').
+        property('data', '{"Owner":"BHARAT"}').
+        property('ownerUserId', 'BHARAT').iterate();
+        
+        
+    
+g.
+        addV('IDM_Artifacts').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Business Application').
+        property('entityKey', '382').
+        property('nativeId', '8a819b536a00e7e4016a01a0fadf0616').
+        property('category', 'IDM_Artifacts').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '51177aa6-97d2-11ea-bb37-0242ac110006' as UUID).
+        property('status', 'Active').
+        property('name', '8a819b536a00e7e4016a01a0fadf0616').
+        as('IDM').iterate();
+
+        addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Business Application').
+        property('entityKey', '382').
+        property('nativeId', '8a819b536a00e7e4016a01a0fadf0616').
+        property('updateTime', Instant.now()).
+        property('entityGlobalId', '51177aa6-97d2-11ea-bb37-0242ac110006' as UUID).
+        property('status', 'Active').
+        property('name', '8a819b536a00e7e4016a01a0fadf0616').
+        as('entity').iterate();
+
+        addE('Is').from('IDM').to('entity').iterate();
+
+        addV('Alert').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Business Application').
+        property('level', 1).
+        property('entityGlobalId', '51177aa6-97d2-11ea-bb37-0242ac110006' as UUID).
+        property('gid', '02177aa7-87d2-11ea-ab37-0242ac110023').
+        property('processId', '02177aa6-97d2-11ea-bb37-0242ac130002' as UUID).
+        property('updateTime', Instant.now()).
+        property('raisedTime', Instant.now()).
+        property('alertType', 'Info').
+        property('taskId', 10).
+        property('taskName', "Cluster Anlaysis").
+        property('summary', 'excessive access').
+        as('alert').iterate();
+
+        addE('With_Alert').from('entity').to('alert').iterate();
+
+        addV('Event').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Business Application').
+        property('createTimeBucket', '202007').
+        property('createTime', Instant.now()).
+        property('entityGlobalId', '51177aa6-97d2-11ea-bb37-0242ac110006' as UUID).
+        property('gid', '02177aa7-87d2-11ea-ab37-0242ac110006').
+        property('eventCategory', 'StageChange').
+        property('type', 'ModifyEntity').
+        property('processId', '02177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('event').iterate();
+        
+        addE('With_Event').from('entity').to('event').iterate();
+        
+        g.
+        addV('IDM_Artifacts').
+        property('tenantId', 'tenant1').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Business Application').
+        property('entityKey', '382').
+        as('IDM').iterate();
+
+        addV('User').
+        property('tenantId', 'tenant1').
+        property('entityKey', 'JDOE').
+        property('appId', 'User Identities').
+        property('nativeType', 'Identity').as('user').iterate();
+
+        addV('Entity').
+        property('tenantId', 'tenant1').
+        property('appId', 'User Identities').
+        property('entityKey', 'JDOE').
+        property('nativeType', 'Identity').
+        property('nativeId', 'jdoe').
+        property('entityGlobalId', '91177aa6-97d2-11ea-bb37-0242ac130002' as UUID).as('userEntity').iterate();
+
+        addE('Is').from("user").to("userEntity").iterate();
+        
+        addE('Is_Related_To').from('IDM').to('user').property('type', "Owner").iterate();
+        
+        addV('IDM_Artifacts').
+        property('tenantId', 'Default').
+        property('appId', 'CAMR-Application Configuration').
+        property('nativeType', 'Sailpoint').
+        property('entityKey', 'Sailpoint').as('sailpoint').iterate(); 
+        
+        addE('Is_Related_To').from('IDM').to('sailpoint').property('type', 'ApplicationType_Application_Relation').iterate();
+        
+        
+
+--------------------CELL_GREMLIN_33--------------------
+//Traverse from IDM_Artifacts to Entity
+g.V().has('IDM_Artifacts', 'appId', "CAMR-Application Configuration").has('nativeType', 'Business Application').has('entityKey', '382').has('tenantId', 'tenant1').as("IDM").out('Is').valueMap()
+
+//Traverse from entity to IDM_Artifacts
+g.V().has('Entity', 'appId', "CAMR-Application Configuration").has('nativeType', 'Business Application').has('entityGlobalId', '51177aa6-97d2-11ea-bb37-0242ac110006' as UUID).has('tenantId', 'tenant1').as("entity").in('Is').valueMap()
+
+// IDM_Artifacts -> Entity -> Alert
+g.V().has('IDM_Artifacts', 'appId', "CAMR-Application Configuration").has('tenantId', 'tenant1').has('nativeType', 'Business Application').has('entityKey', '382').out('Is').out('With_Alert').valueMap()
+
+// IDM_Artifacts -> Entity -> Event
+g.V().has('IDM_Artifacts', 'appId', "CAMR-Application Configuration").has('tenantId', 'tenant1').has('nativeType', 'Business Application').has('entityKey', '382').out('Is').out('With_Event').valueMap()
+
+//TODO following query returns duplicate.
+// Event -> Entity -> IDM_Artifacts
+g.V().hasLabel('Event').has('appId', "CAMR-Application Configuration").has('nativeType', 'Business Application').has('tenantId', 'tenant1').has('createTimeBucket', '202007').has('eventCategory', within('StageChange')).has('createTime', gte(Instant.parse('2015-01-01T00:00:00.00Z'))).in('With_Event').in('Is').valueMap()
+
+// IDM_Artifacts -> Person
+g.V().has('IDM_Artifacts', 'appId', "CAMR-Application Configuration").has('tenantId', 'tenant1').has('nativeType', 'Business Application').has('entityKey', '382').out('Is_Related_To').hasLabel('User').valueMap()
+
+//IDM_Artifacts ->  IDM_Artifacts
+g.V().has('IDM_Artifacts', 'appId', "CAMR-Application Configuration").has('tenantId', 'tenant1').has('nativeType', 'Business Application').has('entityKey', '382').out('Is_Related_To').hasLabel('IDM_Artifacts').valueMap()
+--------------------CELL_GREMLIN_34--------------------
+g.V().hasLabel("Access").has("tenantId", "Default").has("appId", "abcd").has("nativeType", "Accounts").has("entityKey", gte('hokgsfrlig')).limit(100000).where(out("Is").out("With_Alert").has("level", within(1,2,3))).iterate()
